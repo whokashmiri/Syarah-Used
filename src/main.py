@@ -22,6 +22,41 @@ from .syarah import (
 )
 
 
+async def _get_current_url(page: Any, fallback: str = "") -> str:
+    """
+    nodriver pages sometimes don’t expose .url reliably, so use location.href.
+    """
+    try:
+        u = unwrap_remote(await page.evaluate("location.href"))
+        if isinstance(u, str) and u.strip():
+            return u.strip()
+    except Exception:
+        pass
+
+    try:
+        u = getattr(page, "url", "")
+        if isinstance(u, str) and u.strip():
+            return u.strip()
+    except Exception:
+        pass
+
+    return fallback
+
+
+async def _refresh_current_url(page: Any, current_url: str) -> None:
+    """
+    Refresh the CURRENT URL (not the base target url), then wait for listing ready.
+    """
+    log(f"[recover] refresh current url: {current_url}")
+    try:
+        await page.reload()
+    except Exception:
+        await page.get(current_url)
+
+    await wait_for_listing_ready(page)
+    await page.sleep(1.0)
+
+
 async def _try_open_new_tab(browser: Any, url: str) -> Optional[Any]:
     """
     Best-effort only. Some nodriver versions don't support new tabs consistently.
@@ -32,6 +67,7 @@ async def _try_open_new_tab(browser: Any, url: str) -> Optional[Any]:
             return await browser.new_tab(url)
     except Exception:
         pass
+
     try:
         return await browser.get(url, new_tab=True)  # type: ignore
     except Exception:
@@ -82,6 +118,9 @@ async def scrape_once(browser: Any, settings) -> None:
     batch_no = 0
 
     empty_visible_rounds = 0
+    stuck_rounds = 0
+    last_seen_unique = 0
+    last_scroll_after = None
 
     while True:
         batch_no += 1
@@ -90,10 +129,21 @@ async def scrape_once(browser: Any, settings) -> None:
         if batch_no == 1:
             log(f"[debug] first batch sample: {json.dumps(visible_cards[:3], ensure_ascii=False)}")
 
+        # -------------------------
+        # If nothing visible, wait a bit; if still not done and repeated, refresh current URL
+        # -------------------------
         if not visible_cards:
             empty_visible_rounds += 1
-            log(f"[batch {batch_no}] visible=0 (round={empty_visible_rounds}) -> waiting, not scrolling")
+            log(f"[batch {batch_no}] visible=0 (round={empty_visible_rounds}) -> waiting")
+
+            if total and len(processed_ids) < int(total) and empty_visible_rounds >= 8:
+                cur_url = await _get_current_url(page, fallback=settings.target_url)
+                await _refresh_current_url(page, cur_url)
+                empty_visible_rounds = 0
+                continue
+
             await page.sleep(1.2)
+
             if empty_visible_rounds >= 20:
                 log("[stop] no cards detected after many retries; exiting this run")
                 break
@@ -101,6 +151,7 @@ async def scrape_once(browser: Any, settings) -> None:
 
         empty_visible_rounds = 0
 
+        # compute unprocessed AFTER we have visible cards
         unprocessed = [c for c in visible_cards if int(c["id"]) not in processed_ids]
 
         log(
@@ -108,13 +159,43 @@ async def scrape_once(browser: Any, settings) -> None:
             f"processed={processed} inserted={inserted} updated={updated} skipped={skipped}"
         )
 
+        # -------------------------
+        # If no new cards in view, try scrolling.
+        # If scrolling stalls AND we're not done, refresh current URL.
+        # -------------------------
         if not unprocessed:
             info = _scroll_info(await page.evaluate(JS_SCROLL_STEP))
-            log(f"[scroll] (no new) y:{info.get('beforeY')}->{info.get('afterY')} h={info.get('h')}")
+            after_y = info.get("afterY")
+
+            log(f"[scroll] (no new) y:{info.get('beforeY')}->{after_y} h={info.get('h')}")
             await page.sleep(settings.scroll_pause_sec)
+
+            # ✅ stop only when all ads scraped
             if total and len(processed_ids) >= int(total):
                 break
+
+            # "stuck" = afterY not changing AND processed_unique not increasing
+            progressed_scroll = (after_y is not None and after_y != last_scroll_after)
+            progressed_ids = (len(processed_ids) != last_seen_unique)
+
+            if progressed_scroll or progressed_ids:
+                stuck_rounds = 0
+            else:
+                stuck_rounds += 1
+
+            last_scroll_after = after_y
+            last_seen_unique = len(processed_ids)
+
+            # refresh threshold
+            if total and len(processed_ids) < int(total) and stuck_rounds >= 8:
+                cur_url = await _get_current_url(page, fallback=settings.target_url)
+                await _refresh_current_url(page, cur_url)
+                stuck_rounds = 0
+
             continue
+
+        # ✅ we have new cards to process; reset stall counter
+        stuck_rounds = 0
 
         # ✅ Process max 16 per view
         chunk = unprocessed[:16]
@@ -129,7 +210,10 @@ async def scrape_once(browser: Any, settings) -> None:
 
             # already_have() now returns True only if doc is "good"
             if already_have(col, pid):
-                log(f"[db] skip good existing id={pid} | processed={processed} inserted={inserted} updated={updated}")
+                log(
+                    f"[db] skip good existing id={pid} | "
+                    f"processed={processed} inserted={inserted} updated={updated}"
+                )
                 skipped += 1
                 continue
 
@@ -144,9 +228,6 @@ async def scrape_once(browser: Any, settings) -> None:
 
             # ✅ Fetch via requests (DevTools headers)
             payload = fetch_post_payloads_requests(api_sess, settings.api_lang, pid)
-
-
-
 
             if tab:
                 try:
