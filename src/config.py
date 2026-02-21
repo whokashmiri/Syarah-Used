@@ -65,11 +65,11 @@ class Settings:
 
 def get_settings() -> Settings:
     return Settings(
-        target_url=_get("TARGET_URL", "https://syarah.com/filters"),
+        target_url=_get("TARGET_URL", "https://syarah.com/filters?condition_id=1"),
         headless=(_get("HEADLESS", "false").lower() == "true"),
 
         mongo_url=_get("MONGO_URL", "") or "",
-        mongo_db=_get("MONGO_DB", "projectForever") or "projectForever",
+        mongo_db=_get("MONGO_DB", "ElectronDB") or "ElectronDB",
         mongo_collection=_get("MONGO_COLLECTION", "syarahUsed") or "syarahUsed",
 
         check_interval_hours=_get_int("CHECK_INTERVAL_HOURS", 48),
